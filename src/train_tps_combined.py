@@ -13,7 +13,7 @@ import wandb
 from torch.utils.data import DataLoader
 from torchvision.utils import save_image
 from tqdm import tqdm
-
+from lightning.fabric.loggers import TensorBoardLogger
 from dataset.dresscode import DressCodeDataset
 from dataset.vitonhd import VitonHDDataset
 from models.ConvNet_TPS import ConvNet_TPS
@@ -36,21 +36,22 @@ def compute_metric(dataloader: DataLoader, tps: ConvNet_TPS, criterion_l1: nn.L1
     ground truth image.
     """
     tps.eval()
-    if refinement:
+    if refinement: # will be there for the refinement finetuining step
         refinement.eval()
 
     running_loss = 0.
     vgg_running_loss = 0
     for step, inputs in enumerate(tqdm(dataloader)):
-        cloth = inputs['cloth'].to(device)
-        image = inputs['image'].to(device)
-        im_cloth = inputs['im_cloth'].to(device)
-        im_mask = inputs['im_mask'].to(device)
+        cloth = inputs['cloth']
+        image = inputs['image']
+        im_cloth = inputs['im_cloth']
+        im_mask = inputs['im_mask']
         pose_map = inputs.get('dense_uv')
         if pose_map is None:
             pose_map = inputs['pose_map']
-        pose_map = pose_map.to(device)
+        pose_map = pose_map
 
+        # for the TPS training, data loader is already giving (256, 192) resolution images
         # TPS parameters prediction
         # For sake of performance, the TPS parameters are predicted on a low resolution image
         low_cloth = torchvision.transforms.functional.resize(cloth, (256, 192),
@@ -67,7 +68,7 @@ def compute_metric(dataloader: DataLoader, tps: ConvNet_TPS, criterion_l1: nn.L1
         agnostic = torch.cat([low_im_mask, low_pose_map], 1)
 
         low_grid, theta, rx, ry, cx, cy, rg, cg = tps(low_cloth, agnostic)
-
+        # upsample the tps predicted grid to the (512, 384)
         # We upsample the grid to the original image size and warp the cloth using the predicted TPS parameters
         highres_grid = torchvision.transforms.functional.resize(low_grid.permute(0, 3, 1, 2),
                                                                 size=(height, width),
@@ -75,6 +76,7 @@ def compute_metric(dataloader: DataLoader, tps: ConvNet_TPS, criterion_l1: nn.L1
                                                                 antialias=True).permute(0, 2, 3, 1)
         warped_cloth = F.grid_sample(cloth, highres_grid, padding_mode='border')
 
+        # for tps training this is None
         if refinement:
             # Refine the warped cloth using the refinement network
             warped_cloth = torch.cat([im_mask, pose_map, warped_cloth], 1)
@@ -87,10 +89,16 @@ def compute_metric(dataloader: DataLoader, tps: ConvNet_TPS, criterion_l1: nn.L1
             vgg_loss = criterion_vgg(warped_cloth, im_cloth)
             vgg_running_loss += vgg_loss.item()
 
+
+    # gather from all the processes to compute per epoch loss
+    running_loss = fabric.all_gather(running_loss).sum() / len(dataloader.dataset)
+    vgg_running_loss = fabric.all_gather(vgg_running_loss).sum() / len(dataloader.dataset)
+
     visual = [[image, cloth, im_cloth, warped_cloth.clamp(-1, 1)]]
-    loss = running_loss / (step + 1)
-    vgg_loss = vgg_running_loss / (step + 1)
-    return loss, vgg_loss, visual
+    # loss = running_loss / (step + 1)
+    # vgg_loss = vgg_running_loss / (step + 1)
+    # return loss, vgg_loss, visual
+    return running_loss, vgg_running_loss, visual
 
 
 def training_loop_tps(dataloader: DataLoader, tps: ConvNet_TPS, optimizer_tps: torch.optim.Optimizer,
@@ -104,17 +112,18 @@ def training_loop_tps(dataloader: DataLoader, tps: ConvNet_TPS, optimizer_tps: t
     running_l1_loss = 0.
     running_const_loss = 0.
     for step, inputs in enumerate(tqdm(dataloader)):  # Yield images with low resolution (256x192)
-        low_cloth = inputs['cloth'].to(device, non_blocking=True)
-        low_image = inputs['image'].to(device, non_blocking=True)
-        low_im_cloth = inputs['im_cloth'].to(device, non_blocking=True)
-        low_im_mask = inputs['im_mask'].to(device, non_blocking=True)
+        low_cloth = inputs['cloth']
+        low_image = inputs['image']
+        low_im_cloth = inputs['im_cloth']
+        low_im_mask = inputs['im_mask']
 
         low_pose_map = inputs.get('dense_uv')
         if low_pose_map is None:  # If the dataset does not provide dense UV maps, use the pose map (keypoints) instead
             low_pose_map = inputs['pose_map']
-        low_pose_map = low_pose_map.to(device, non_blocking=True)
+        low_pose_map = low_pose_map
 
-        with torch.cuda.amp.autocast():
+        # with torch.cuda.amp.autocast():
+        with fabric.autocast():
             # TPS parameters prediction
             agnostic = torch.cat([low_im_mask, low_pose_map], 1)
             low_grid, theta, rx, ry, cx, cy, rg, cg = tps(low_cloth, agnostic)
@@ -130,19 +139,26 @@ def training_loop_tps(dataloader: DataLoader, tps: ConvNet_TPS, optimizer_tps: t
 
         # Update the parameters
         optimizer_tps.zero_grad()
-        scaler.scale(loss).backward()
-        scaler.step(optimizer_tps)
-        scaler.update()
+        # scaler.scale(loss).backward()
+        fabric.backward(loss)
+        # scaler.step(optimizer_tps)
+        optimizer_tps.step()
+        # scaler.update()
 
         running_loss += loss.item()
         running_l1_loss += l1_loss.item()
         running_const_loss += const_loss.item()
 
     visual = [[low_image, low_cloth, low_im_cloth, low_warped_cloth.clamp(-1, 1)]]
-    loss = running_loss / (step + 1)
-    l1_loss = running_l1_loss / (step + 1)
-    const_loss = running_const_loss / (step + 1)
-    return loss, l1_loss, const_loss, visual
+    running_loss = fabric.all_gather(running_loss).sum() / len(dataloader.dataset)
+    running_l1_loss = fabric.all_gather(running_l1_loss).sum() / len(dataloader.dataset)
+    running_const_loss = fabric.all_gather(running_const_loss).sum() / len(dataloader.dataset)
+
+    # loss = running_loss / (step + 1)
+    # l1_loss = running_l1_loss / (step + 1)
+    # const_loss = running_const_loss / (step + 1)
+    # return loss, l1_loss, const_loss, visual
+    return running_loss, running_l1_loss, running_const_loss, visual
 
 
 def training_loop_refinement(dataloader: DataLoader, tps: ConvNet_TPS, refinement: UNetVanilla,
@@ -158,16 +174,16 @@ def training_loop_refinement(dataloader: DataLoader, tps: ConvNet_TPS, refinemen
     running_l1_loss = 0.
     running_vgg_loss = 0.
     for step, inputs in enumerate(tqdm(dataloader)):
-        cloth = inputs['cloth'].to(device)
-        image = inputs['image'].to(device)
-        im_cloth = inputs['im_cloth'].to(device)
-        im_mask = inputs['im_mask'].to(device)
+        cloth = inputs['cloth']
+        image = inputs['image']
+        im_cloth = inputs['im_cloth']
+        im_mask = inputs['im_mask']
 
         pose_map = inputs.get('dense_uv')
         if pose_map is None:  # If the dataset does not provide dense UV maps, use the pose map (keypoints) instead
             pose_map = inputs['pose_map']
-        pose_map = pose_map.to(device)
-
+        pose_map = pose_map
+        # dataloader will be giving (512, 384) resolution images, so no need to resize for tps
         # Resize the inputs to the low resolution for the TPS network
         low_cloth = torchvision.transforms.functional.resize(cloth, (256, 192),
                                                              torchvision.transforms.InterpolationMode.BILINEAR,
@@ -179,7 +195,7 @@ def training_loop_refinement(dataloader: DataLoader, tps: ConvNet_TPS, refinemen
                                                                 torchvision.transforms.InterpolationMode.BILINEAR,
                                                                 antialias=True)
 
-        with torch.cuda.amp.autocast():
+        with fabric.autocast():
             # TPS parameters prediction
             agnostic = torch.cat([low_im_mask, low_pose_map], 1)
 
@@ -205,20 +221,27 @@ def training_loop_refinement(dataloader: DataLoader, tps: ConvNet_TPS, refinemen
             loss = l1_loss * l1_weight + vgg_loss * vgg_weight
 
         # Update the parameters
-        optimizer_ref.zero_grad()
-        scaler.scale(loss).backward()
-        scaler.step(optimizer_ref)
-        scaler.update()
+        optimizer_ref.zero_grad() # zero the gradients
+        fabric.backward(loss) # calculate the gradients
+        # scaler.scale(loss).backward()
+        # scaler.step(optimizer_ref)
+        optimizer_ref.step() # update the parameters
+        # scaler.update()
 
         running_loss += loss.item()
         running_l1_loss += l1_loss.item()
         running_vgg_loss += vgg_loss.item()
 
+    running_loss = fabric.all_gather(running_loss).sum() / len(dataloader.dataset)
+    running_l1_loss = fabric.all_gather(running_l1_loss).sum() / len(dataloader.dataset)
+    running_vgg_loss = fabric.all_gather(running_vgg_loss).sum() / len(dataloader.dataset)
+
     visual = [[image, cloth, im_cloth, low_warped_cloth.clamp(-1, 1)]]
-    loss = running_loss / (step + 1)
-    l1_loss = running_l1_loss / (step + 1)
-    vgg_loss = running_vgg_loss / (step + 1)
-    return loss, l1_loss, vgg_loss, visual
+    # loss = running_loss / (step + 1)
+    # l1_loss = running_l1_loss / (step + 1)
+    # vgg_loss = running_vgg_loss / (step + 1)
+    # return loss, l1_loss, vgg_loss, visual
+    return running_loss, running_l1_loss, running_vgg_loss, visual
 
 
 @torch.no_grad()
@@ -234,13 +257,13 @@ def extract_images(dataloader: DataLoader, tps: ConvNet_TPS, refinement: UNetVan
     for step, inputs in enumerate(tqdm(dataloader)):
         c_name = inputs['c_name']
         im_name = inputs['im_name']
-        cloth = inputs['cloth'].to(device)
+        cloth = inputs['cloth']
         category = inputs.get('category')
-        im_mask = inputs['im_mask'].to(device)
+        im_mask = inputs['im_mask']
         pose_map = inputs.get('dense_uv')
         if pose_map is None:
             pose_map = inputs['pose_map']
-        pose_map = pose_map.to(device)
+        pose_map = pose_map
 
         # Resize the inputs to the low resolution for the TPS network
         low_cloth = torchvision.transforms.functional.resize(cloth, (256, 192),
@@ -257,7 +280,7 @@ def extract_images(dataloader: DataLoader, tps: ConvNet_TPS, refinement: UNetVan
         agnostic = torch.cat([low_im_mask, low_pose_map], 1)
 
         low_grid, theta, rx, ry, cx, cy, rg, cg = tps(low_cloth, agnostic)
-
+        # upsample to resolution : (512, 384)
         # We upsample the grid to the original image size and warp the cloth using the predicted TPS parameters
         highres_grid = torchvision.transforms.functional.resize(low_grid.permute(0, 3, 1, 2),
                                                                 size=(height, width),
@@ -311,7 +334,7 @@ def parse_args():
     return args
 
 
-def main():
+def main(logger, fabric):
     args = parse_args()
     print(args.exp_name)
 
@@ -328,100 +351,137 @@ def main():
     if args.dense:
         dataset_output_list.append('dense_uv')
 
+    # ======================================================================
+    #                   training datasets
+    # ======================================================================
+
     # Training dataset and dataloader
-    if args.dataset == "vitonhd":
-        dataset_train = VitonHDDataset(phase='train',
+    # if args.dataset == "vitonhd":
+    dataset_train_vton = VitonHDDataset(phase='train',
                                        outputlist=dataset_output_list,
                                        dataroot_path=args.vitonhd_dataroot,
                                        size=(args.height, args.width))
-    elif args.dataset == "dresscode":
-        dataset_train = DressCodeDataset(dataroot_path=args.dresscode_dataroot,
+    # elif args.dataset == "dresscode":
+    dataset_train_dress = DressCodeDataset(dataroot_path=args.dresscode_dataroot,
                                          phase='train',
                                          outputlist=dataset_output_list,
                                          size=(args.height, args.width))
-    else:
-        raise NotImplementedError("Dataset should be either vitonhd or dresscode")
-
+    # else:
+    #     raise NotImplementedError("Dataset should be either vitonhd or dresscode")
+    combined_train_ds = torch.utils.data.ConcatDataset([dataset_train_vton, dataset_train_dress])
     dataloader_train = DataLoader(batch_size=args.batch_size,
-                                  dataset=dataset_train,
+                                  dataset=combined_train_ds,
                                   shuffle=True,
                                   num_workers=args.workers)
 
+
+    dataloader_train = fabric.setup_dataloaders(dataloader_train)
+    # ======================================================================
+    #                   val datasets
+    # ======================================================================
+
     # Validation dataset and dataloader
-    if args.dataset == "vitonhd":
-        dataset_test_paired = VitonHDDataset(phase='test',
+    # if args.dataset == "vitonhd":
+    dataset_test_paired_viton = VitonHDDataset(phase='test',
                                              dataroot_path=args.vitonhd_dataroot,
                                              outputlist=dataset_output_list, size=(args.height, args.width))
 
-        dataset_test_unpaired = VitonHDDataset(phase='test',
+    dataset_test_unpaired_viton = VitonHDDataset(phase='test',
                                                order='unpaired',
                                                dataroot_path=args.vitonhd_dataroot,
                                                outputlist=dataset_output_list, size=(args.height, args.width))
 
-    elif args.dataset == "dresscode":
-        dataset_test_paired = DressCodeDataset(dataroot_path=args.dresscode_dataroot,
+    # elif args.dataset == "dresscode":
+    dataset_test_paired_dress = DressCodeDataset(dataroot_path=args.dresscode_dataroot,
                                                phase='test',
                                                outputlist=dataset_output_list, size=(args.height, args.width))
 
-        dataset_test_unpaired = DressCodeDataset(phase='test',
+    dataset_test_unpaired_dress = DressCodeDataset(phase='test',
                                                  order='unpaired',
                                                  dataroot_path=args.dresscode_dataroot,
                                                  outputlist=dataset_output_list, size=(args.height, args.width))
 
-    else:
-        raise NotImplementedError("Dataset should be either vitonhd or dresscode")
+    # else:
+    #     raise NotImplementedError("Dataset should be either vitonhd or dresscode")
 
-    dataloader_test_paired = DataLoader(batch_size=args.batch_size,
-                                        dataset=dataset_test_paired,
+    combined_test_ds = torch.utils.data.ConcatDataset([dataset_test_paired_viton, dataset_test_unpaired_viton, dataset_test_paired_dress, dataset_test_unpaired_dress])
+
+    dataloader_test = DataLoader(batch_size=args.batch_size,
+                                        dataset=combined_test_ds,
                                         shuffle=True,
                                         num_workers=args.workers, drop_last=True)
 
-    dataloader_test_unpaired = DataLoader(batch_size=args.batch_size,
-                                          dataset=dataset_test_unpaired,
-                                          shuffle=True,
-                                          num_workers=args.workers, drop_last=True)
+    dataloader_test = fabric.setup_dataloaders(dataloader_test)
+
+
+    # ====================================================
+    #               define models
+    # ====================================================
 
     # Define TPS and refinement network
     input_nc = 5 if args.dense else 21
     n_layer = 3
-    tps = ConvNet_TPS(256, 192, input_nc, n_layer).to(device)
+    tps = ConvNet_TPS(256, 192, input_nc, n_layer)
 
     refinement = UNetVanilla(
         n_channels=8 if args.dense else 24,
         n_classes=3,
-        bilinear=True).to(device)
+        bilinear=True)
 
     # Define optimizer, scaler and loss
     optimizer_tps = torch.optim.Adam(tps.parameters(), lr=args.lr, betas=(0.5, 0.99))
     optimizer_ref = torch.optim.Adam(list(refinement.parameters()), lr=args.lr, betas=(0.5, 0.99))
 
-    scaler = torch.cuda.amp.GradScaler()
+    tps, optimizer_tps = fabric.setup(tps, optimizer_tps)
+    refinement, optimizer_ref = fabric.setup(refinement, optimizer_ref)
+
+    # scaler = torch.cuda.amp.GradScaler()
     criterion_l1 = nn.L1Loss()
 
     if args.vgg_weight > 0:
-        criterion_vgg = VGGLoss().to(device)
+        criterion_vgg = VGGLoss()
     else:
         criterion_vgg = None
 
     start_epoch = 0
 
+    # ============================================================
+    #             load from per-trained ckpt logic
+    # ============================================================
+
     if os.path.exists(os.path.join(args.checkpoints_dir, args.exp_name, f"checkpoint_last.pth")):
-        print('Loading full checkpoint')
-        state_dict = torch.load(os.path.join(args.checkpoints_dir, args.exp_name, f"checkpoint_last.pth"))
-        tps.load_state_dict(state_dict['tps'])
-        refinement.load_state_dict(state_dict['refinement'])
-        optimizer_tps.load_state_dict(state_dict['optimizer_tps'])
-        optimizer_ref.load_state_dict(state_dict['optimizer_ref'])
-        start_epoch = state_dict['epoch']
+        fabric.print('Loading full checkpoint')
+
+        # REFERENCE: https://lightning.ai/docs/fabric/stable/guide/checkpoint.html
+        EPOCH = None
+        # define the state to load from
+        _state = {
+
+            'tps' : tps,
+            'refinement' : refinement,
+            'optimizer_tps' : optimizer_tps,
+            'optimizer_ref' : optimizer_ref,
+            'epoch' : EPOCH
+        }
+        # load the checkpoint on all devices
+        fabric.load(os.path.join(args.checkpoints_dir, args.exp_name, f"checkpoint_last.pth"),
+                    _state)
+        # state_dict = torch.load(os.path.join(args.checkpoints_dir, args.exp_name, f"checkpoint_last.pth"))
+        # tps.load_state_dict(state_dict['tps'])
+        # refinement.load_state_dict(state_dict['refinement'])
+        # optimizer_tps.load_state_dict(state_dict['optimizer_tps'])
+        # optimizer_ref.load_state_dict(state_dict['optimizer_ref'])
+        # start_epoch = state_dict['epoch']
 
         if args.only_extraction:
-            print("Extracting warped cloth images...")
-            extraction_dataset_paired = torch.utils.data.ConcatDataset([dataset_test_paired, dataset_train])
-            extraction_dataloader_paired = DataLoader(batch_size=args.batch_size,
-                                                      dataset=extraction_dataset_paired,
-                                                      shuffle=False,
-                                                      num_workers=args.workers,
-                                                      drop_last=False)
+            fabric.print("Extracting warped cloth images...")
+            # extraction_dataset_paired = torch.utils.data.ConcatDataset([dataset_test_paired, dataset_train])
+            # extraction_dataloader_paired = DataLoader(batch_size=args.batch_size,
+            #                                           dataset=extraction_dataset_paired,
+            #                                           shuffle=False,
+            #                                           num_workers=args.workers,
+            #                                           drop_last=False)
+            extraction_dataloader_paired = dataloader_test
 
             if args.save_path:
                 warped_cloth_root = args.save_path
@@ -429,16 +489,19 @@ def main():
                 warped_cloth_root = PROJECT_ROOT / 'data'
 
             save_name_paired = warped_cloth_root / 'warped_cloths' / args.dataset
+            fabric.print(f"extracting to {save_name_paired}")
             extract_images(extraction_dataloader_paired, tps, refinement, save_name_paired, args.height, args.width)
 
-            extraction_dataset = dataset_test_unpaired
-            extraction_dataloader_paired = DataLoader(batch_size=args.batch_size,
-                                                      dataset=extraction_dataset,
-                                                      shuffle=False,
-                                                      num_workers=args.workers)
+            # since we combined all the test datasets so no need for this
 
-            save_name_unpaired = warped_cloth_root / 'warped_cloths_unpaired' / args.dataset
-            extract_images(extraction_dataloader_paired, tps, refinement, save_name_unpaired, args.height, args.width)
+            # extraction_dataset = dataset_test_unpaired
+            # extraction_dataloader_paired = DataLoader(batch_size=args.batch_size,
+            #                                           dataset=extraction_dataset,
+            #                                           shuffle=False,
+            #                                           num_workers=args.workers)
+            #
+            # save_name_unpaired = warped_cloth_root / 'warped_cloths_unpaired' / args.dataset
+            # extract_images(extraction_dataloader_paired, tps, refinement, save_name_unpaired, args.height, args.width)
             exit()
 
     if args.only_extraction and not os.path.exists(
@@ -446,25 +509,34 @@ def main():
         print("No checkpoint found, before extracting warped cloth images, please train the model first.")
         exit()
 
+    # ===============================================================
+    #                         TPS training loop
+    # ===============================================================
     # Training loop for TPS training
     # Set training dataset height and width to (256, 192) since the TPS is trained using a lower resolution
-    dataset_train.height = 256
-    dataset_train.width = 192
+    combined_train_ds.height = 256
+    combined_train_ds.width = 192
+    # dataset_train.height = 256
+    # dataset_train.width = 192
+
     for e in range(start_epoch, args.epochs_tps):
-        print(f"Epoch {e}/{args.epochs_tps}")
-        print('train')
+        fabric.print(f"Epoch {e}/{args.epochs_tps}")
+        fabric.print('train')
+        # one epoch for training
         train_loss, train_l1_loss, train_const_loss, visual = training_loop_tps(
             dataloader_train,
             tps,
             optimizer_tps,
             criterion_l1,
-            scaler,
+            None,
             args.const_weight)
 
+        # one epoch for validation metrics
         # Compute loss on paired test set
-        print('paired test')
+        fabric.print('paired/unpaired combined metrics')
         running_loss, vgg_running_loss, visual = compute_metric(
-            dataloader_test_paired,
+            # dataloader_test_paired
+            dataloader_test,
             tps,
             criterion_l1,
             criterion_vgg,
@@ -473,54 +545,73 @@ def main():
             width=args.width)
 
         imgs = torchvision.utils.make_grid(torch.cat(visual[0]), nrow=len(visual[0][0]), padding=2, normalize=True,
-                                           range=None, scale_each=False, pad_value=0)
+                                           value_range=None, scale_each=False, pad_value=0)
 
-        # Compute loss on unpaired test set
-        print('unpaired test')
-        running_loss_unpaired, vgg_running_loss_unpaired, visual = compute_metric(
-            dataloader_test_unpaired,
-            tps,
-            criterion_l1,
-            criterion_vgg,
-            refinement=None,
-            height=args.height,
-            width=args.width)
-
-        imgs_unpaired = torchvision.utils.make_grid(torch.cat(visual[0]), nrow=len(visual[0][0]), padding=2,
-                                                    normalize=True, range=None,
-                                                    scale_each=False, pad_value=0)
+        # # Compute loss on unpaired test set
+        # print('unpaired test')
+        # running_loss_unpaired, vgg_running_loss_unpaired, visual = compute_metric(
+        #     dataloader_test_unpaired,
+        #     tps,
+        #     criterion_l1,
+        #     criterion_vgg,
+        #     refinement=None,
+        #     height=args.height,
+        #     width=args.width)
+        #
+        # imgs_unpaired = torchvision.utils.make_grid(torch.cat(visual[0]), nrow=len(visual[0][0]), padding=2,
+        #                                             normalize=True, range=None,
+        #                                             scale_each=False, pad_value=0)
 
         # Log to wandb
         if args.wandb_log:
-            wandb.log({
-                'train/loss': train_loss,
-                'train/l1_loss': train_l1_loss,
-                'train/const_loss': train_const_loss,
-                'train/vgg_loss': 0,
-                'eval/eval_loss_paired': running_loss,
-                'eval/eval_vgg_loss_paired': vgg_running_loss,
-                'eval/eval_loss_unpaired': running_loss_unpaired,
-                'eval/eval_vgg_loss_unpaired': vgg_running_loss_unpaired,
-                'images_paired': wandb.Image(imgs),
-                'images_unpaired': wandb.Image(imgs_unpaired),
-            })
+            if fabric.is_global_zero:
+                wandb.log({
+                    'train/loss': train_loss,
+                    'train/l1_loss': train_l1_loss,
+                    'train/const_loss': train_const_loss,
+                    'train/vgg_loss': 0,
+                    'eval/eval_loss_paired_unpaired': running_loss,
+                    'eval/eval_vgg_loss_paired_unpaired': vgg_running_loss,
+                    # 'eval/eval_loss_unpaired': running_loss_unpaired,
+                    # 'eval/eval_vgg_loss_unpaired': vgg_running_loss_unpaired,
+                    'images_paired_unpaired': wandb.Image(imgs),
+                    # 'images_unpaired': wandb.Image(imgs_unpaired),
+                })
+            fabric.barrier()
 
+        # =========================================================================
+        #                       save the checkpoint
+        # =========================================================================
         # Save checkpoint
         os.makedirs(os.path.join(args.checkpoints_dir, args.exp_name), exist_ok=True)
-        torch.save({
-            'epoch': e + 1,
-            'tps': tps.state_dict(),
-            'refinement': refinement.state_dict(),
-            'optimizer_tps': optimizer_tps.state_dict(),
-            'optimizer_ref': optimizer_ref.state_dict(),
-        }, os.path.join(args.checkpoints_dir, args.exp_name, f"checkpoint_last.pth"))
+        to_save_state = {
 
-    scaler = torch.cuda.amp.GradScaler()  # Initialize scaler again for refinement
+            'tps': tps,
+            'refinement': refinement,
+            'optimizer_tps': optimizer_tps,
+            'optimizer_ref': optimizer_ref,
+            'epoch': e + 1
+        }
+        fabric.save(os.path.join(args.checkpoints_dir, args.exp_name, f"checkpoint_last.pth"), to_save_state)
+        # torch.save({
+        #     'epoch': e + 1,
+        #     'tps': tps.state_dict(),
+        #     'refinement': refinement.state_dict(),
+        #     'optimizer_tps': optimizer_tps.state_dict(),
+        #     'optimizer_ref': optimizer_ref.state_dict(),
+        # }, os.path.join(args.checkpoints_dir, args.exp_name, f"checkpoint_last.pth"))
+
+    # =========================================================================
+    #                 TPS training ends here trained model will be put to
+    #    eval. mode and refinement network training will start from here
+    # =========================================================================
+
+    # scaler = torch.cuda.amp.GradScaler()  # Initialize scaler again for refinement
 
     # Training loop for refinement
     # Set training dataset height and width to (args.height, args.width) since the refinement is trained using a higher resolution
-    dataset_train.height = args.height
-    dataset_train.width = args.width
+    combined_train_ds.height = args.height # set to 512 x 384
+    combined_train_ds.width = args.width
     for e in range(max(start_epoch, args.epochs_tps), max(start_epoch, args.epochs_tps) + args.epochs_refinement):
         print(f"Epoch {e}/{max(start_epoch, args.epochs_tps) + args.epochs_refinement}")
         train_loss, train_l1_loss, train_vgg_loss, visual = training_loop_refinement(
@@ -532,13 +623,13 @@ def main():
             criterion_vgg,
             args.l1_weight,
             args.vgg_weight,
-            scaler,
+            None,
             args.height,
             args.width)
 
         # Compute loss on paired test set
         running_loss, vgg_running_loss, visual = compute_metric(
-            dataloader_test_paired,
+            dataloader_test,
             tps,
             criterion_l1,
             criterion_vgg,
@@ -547,56 +638,68 @@ def main():
             width=args.width)
 
         imgs = torchvision.utils.make_grid(torch.cat(visual[0]), nrow=len(visual[0][0]), padding=2, normalize=True,
-                                           range=None, scale_each=False, pad_value=0)
+                                           value_range=None, scale_each=False, pad_value=0)
 
-        # Compute loss on unpaired test set
-        running_loss_unpaired, vgg_running_loss_unpaired, visual = compute_metric(
-            dataloader_test_unpaired,
-            tps,
-            criterion_l1,
-            criterion_vgg,
-            refinement=refinement,
-            height=args.height,
-            width=args.width)
-
-        imgs_unpaired = torchvision.utils.make_grid(torch.cat(visual[0]), nrow=len(visual[0][0]), padding=2,
-                                                    normalize=True, range=None,
-                                                    scale_each=False, pad_value=0)
+        # # Compute loss on unpaired test set
+        # running_loss_unpaired, vgg_running_loss_unpaired, visual = compute_metric(
+        #     dataloader_test_unpaired,
+        #     tps,
+        #     criterion_l1,
+        #     criterion_vgg,
+        #     refinement=refinement,
+        #     height=args.height,
+        #     width=args.width)
+        #
+        # imgs_unpaired = torchvision.utils.make_grid(torch.cat(visual[0]), nrow=len(visual[0][0]), padding=2,
+        #                                             normalize=True, range=None,
+        #                                             scale_each=False, pad_value=0)
 
         # Log to wandb
         if args.wandb_log:
-            wandb.log({
-                'train/loss': train_loss,
-                'train/l1_loss': train_l1_loss,
-                'train/const_loss': 0,
-                'train/vgg_loss': train_vgg_loss,
-                'eval/eval_loss_paired': running_loss,
-                'eval/eval_vgg_loss_paired': vgg_running_loss,
-                'eval/eval_loss_unpaired': running_loss_unpaired,
-                'eval/eval_vgg_loss_unpaired': vgg_running_loss_unpaired,
-                'images_paired': wandb.Image(imgs),
-                'images_unpaired': wandb.Image(imgs_unpaired),
-            })
+            if fabric.is_global_zero:
+                wandb.log({
+                    'train/loss': train_loss,
+                    'train/l1_loss': train_l1_loss,
+                    'train/const_loss': 0,
+                    'train/vgg_loss': train_vgg_loss,
+                    'eval/eval_loss_paired_unpaired': running_loss,
+                    'eval/eval_vgg_loss_paired_unpaired': vgg_running_loss,
+                    # 'eval/eval_loss_unpaired': running_loss_unpaired,
+                    # 'eval/eval_vgg_loss_unpaired': vgg_running_loss_unpaired,
+                    'images_paired_unpaired': wandb.Image(imgs),
+                    # 'images_unpaired': wandb.Image(imgs_unpaired),
+                })
+            fabric.barrier()
 
         # Save checkpoint
         os.makedirs(os.path.join(args.checkpoints_dir, args.exp_name), exist_ok=True)
-        torch.save({
-            'epoch': e + 1,
-            'tps': tps.state_dict(),
-            'refinement': refinement.state_dict(),
-            'optimizer_tps': optimizer_tps.state_dict(),
-            'optimizer_ref': optimizer_ref.state_dict(),
-        }, os.path.join(args.checkpoints_dir, args.exp_name, f"checkpoint_last.pth"))
+        # torch.save({
+        #     'epoch': e + 1,
+        #     'tps': tps.state_dict(),
+        #     'refinement': refinement.state_dict(),
+        #     'optimizer_tps': optimizer_tps.state_dict(),
+        #     'optimizer_ref': optimizer_ref.state_dict(),
+        # }, os.path.join(args.checkpoints_dir, args.exp_name, f"checkpoint_last.pth"))
+
+        to_save_state_refine = {
+
+            'tps': tps,
+            'refinement': refinement,
+            'optimizer_tps': optimizer_tps,
+            'optimizer_ref': optimizer_ref,
+            'epoch': e + 1
+        }
+        fabric.save(os.path.join(args.checkpoints_dir, args.exp_name, f"checkpoint_last.pth"), to_save_state_refine)
 
     # Extract warped cloth images at the end of training
-    print("Extracting warped cloth images...")
-    extraction_dataset_paired = torch.utils.data.ConcatDataset([dataset_test_paired, dataset_train])
-    extraction_dataloader_paired = DataLoader(batch_size=args.batch_size,
-                                              dataset=extraction_dataset_paired,
-                                              shuffle=False,
-                                              num_workers=args.workers,
-                                              drop_last=False)
-
+    fabric.print("Extracting warped cloth images...")
+    # extraction_dataset_paired = torch.utils.data.ConcatDataset([dataset_test_paired, dataset_train])
+    # extraction_dataloader_paired = DataLoader(batch_size=args.batch_size,
+    #                                           dataset=extraction_dataset_paired,
+    #                                           shuffle=False,
+    #                                           num_workers=args.workers,
+    #                                           drop_last=False)
+    extraction_dataloader_paired = dataloader_test
     if args.save_path:
         warped_cloth_root = args.save_path
     else:
@@ -605,15 +708,20 @@ def main():
     save_name_paired = warped_cloth_root / 'warped_cloths' / args.dataset
     extract_images(extraction_dataloader_paired, tps, refinement, save_name_paired, args.height, args.width)
 
-    extraction_dataset = dataset_test_unpaired
-    extraction_dataloader_paired = DataLoader(batch_size=args.batch_size,
-                                              dataset=extraction_dataset,
-                                              shuffle=False,
-                                              num_workers=args.workers)
-
-    save_name_unpaired = warped_cloth_root / 'warped_cloths_unpaired' / args.dataset
-    extract_images(extraction_dataloader_paired, tps, refinement, save_name_unpaired, args.height, args.width)
+    # already combined all test datasets into one
+    # extraction_dataset = dataset_test_unpaired
+    # extraction_dataloader_paired = DataLoader(batch_size=args.batch_size,
+    #                                           dataset=extraction_dataset,
+    #                                           shuffle=False,
+    #                                           num_workers=args.workers)
+    #
+    # save_name_unpaired = warped_cloth_root / 'warped_cloths_unpaired' / args.dataset
+    # extract_images(extraction_dataloader_paired, tps, refinement, save_name_unpaired, args.height, args.width)
 
 
 if __name__ == '__main__':
-    main()
+    logger = TensorBoardLogger(root_dir="./logs",
+                               name="multi-train-combined-tps")
+    fabric = Fabric(accelerator='auto', strategy='auto', devices='auto', precision='bf16-mixed', loggers=[logger])
+    fabric.launch()
+    main(logger, fabric)
