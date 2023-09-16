@@ -6,6 +6,7 @@ import lightning as L
 from lightning.fabric import Fabric
 import numpy as np
 import torch
+from typing import List
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
@@ -27,6 +28,22 @@ PROJECT_ROOT = Path(__file__).absolute().parents[1].absolute()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+class SubsetDataset(torch.utils.data.Dataset):
+    """
+    create a subset of the torch dataset
+    """
+
+    def __init__(self, dataset: torch.utils.data.Dataset, indices: List[int]):
+        self.dataset = dataset
+        self.indices = indices
+
+    def __getitem__(self, index):
+        return self.dataset[self.indices[index]]
+
+    def __len__(self):
+        return len(self.indices)
+
+
 @torch.no_grad()
 def compute_metric(dataloader: DataLoader, tps: ConvNet_TPS, criterion_l1: nn.L1Loss, criterion_vgg: VGGLoss,
                    refinement: UNetVanilla = None, height: int = 512, width: int = 384) -> tuple[
@@ -36,7 +53,7 @@ def compute_metric(dataloader: DataLoader, tps: ConvNet_TPS, criterion_l1: nn.L1
     ground truth image.
     """
     tps.eval()
-    if refinement: # will be there for the refinement finetuining step
+    if refinement:  # will be there for the refinement finetuining step
         refinement.eval()
 
     running_loss = 0.
@@ -88,7 +105,6 @@ def compute_metric(dataloader: DataLoader, tps: ConvNet_TPS, criterion_l1: nn.L1
         if criterion_vgg:
             vgg_loss = criterion_vgg(warped_cloth, im_cloth)
             vgg_running_loss += vgg_loss.item()
-
 
     # gather from all the processes to compute per epoch loss
     running_loss = fabric.all_gather(running_loss).sum() / len(dataloader.dataset)
@@ -221,11 +237,11 @@ def training_loop_refinement(dataloader: DataLoader, tps: ConvNet_TPS, refinemen
             loss = l1_loss * l1_weight + vgg_loss * vgg_weight
 
         # Update the parameters
-        optimizer_ref.zero_grad() # zero the gradients
-        fabric.backward(loss) # calculate the gradients
+        optimizer_ref.zero_grad()  # zero the gradients
+        fabric.backward(loss)  # calculate the gradients
         # scaler.scale(loss).backward()
         # scaler.step(optimizer_ref)
-        optimizer_ref.step() # update the parameters
+        optimizer_ref.step()  # update the parameters
         # scaler.update()
 
         running_loss += loss.item()
@@ -306,7 +322,8 @@ def extract_images(dataloader: DataLoader, tps: ConvNet_TPS, refinement: UNetVan
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", type=str, required=True, choices=["dresscode", "vitonhd"], help="dataset to use")
+    parser.add_argument("--dataset", type=str, required=True, choices=["dresscode", "vitonhd", "combined"],
+                        help="dataset to use")
     parser.add_argument('--dresscode_dataroot', type=str, help='DressCode dataroot')
     parser.add_argument('--checkpoints_dir', type=str, default=str(PROJECT_ROOT / "TPS_checkpoints"))
     parser.add_argument('--vitonhd_dataroot', type=str, help='VitonHD dataroot')
@@ -317,7 +334,7 @@ def parse_args():
     parser.add_argument("--width", type=int, default=384)
     parser.add_argument('--const_weight', type=float, default=0.01, help='weight for the TPS constraint loss')
     parser.add_argument('--lr', type=float, default=1e-4, help='initial learning rate for adam')
-    parser.add_argument('--wandb_log', default=False, action='store_true', help='use wandb to log the training')
+    parser.add_argument('--wandb_log', default=True, action='store_true', help='use wandb to log the training')
     parser.add_argument('--wandb_project', type=str, default="LaDI_VTON_tps", help='wandb project name')
     parser.add_argument('--wandb_entity', type=str, help='wandb entity name')
     parser.add_argument('--dense', dest='dense', default=False, action='store_true', help='use dense uv map')
@@ -330,22 +347,41 @@ def parse_args():
     parser.add_argument('--epochs_tps', type=int, default=50, help='number of epochs to train the TPS network')
     parser.add_argument('--epochs_refinement', type=int, default=50,
                         help='number of epochs to train the refinement network')
+
+    # add store true argument --dry_test
+    parser.add_argument('--dry_test', dest='dry_test', default=False, action='store_true',
+                        help='dry run test with 1000 samples for train and test')
     args = parser.parse_args()
     return args
 
 
+# ==========================================================================
+#                             ⚡ Main process
+# ==========================================================================
+
 def main(logger, fabric):
     args = parse_args()
-    print(args.exp_name)
+    fabric.print(args.exp_name)
+
+    # save the args to logger (tensorboard)
+    if fabric.is_global_zero:
+        logger.log_hyperparams(vars(args))
+
+    fabric.barrier()
 
     if args.dataset == "vitonhd" and args.vitonhd_dataroot is None:
         raise ValueError("VitonHD dataroot must be provided")
     if args.dataset == "dresscode" and args.dresscode_dataroot is None:
         raise ValueError("DressCode dataroot must be provided")
+    if args.dataset == "combined" and args.dresscode_dataroot is None and args.vitonhd_dataroot is None:
+        raise ValueError("DressCode dataroot and VITON-HD must be provided")
 
     # Enable wandb logging
     if args.wandb_log:
-        wandb.init(project=args.wandb_project, entity=args.wandb_entity, name=args.exp_name, config=vars(args))
+        if fabric.is_global_zero:
+            wandb.init(project=args.wandb_project, entity=args.wandb_entity, name=args.exp_name)
+            wandb.config.update(vars(args))
+        fabric.barrier()
 
     dataset_output_list = ['c_name', 'im_name', 'cloth', 'image', 'im_cloth', 'im_mask', 'pose_map', 'category']
     if args.dense:
@@ -358,22 +394,32 @@ def main(logger, fabric):
     # Training dataset and dataloader
     # if args.dataset == "vitonhd":
     dataset_train_vton = VitonHDDataset(phase='train',
-                                       outputlist=dataset_output_list,
-                                       dataroot_path=args.vitonhd_dataroot,
-                                       size=(args.height, args.width))
+                                        outputlist=dataset_output_list,
+                                        dataroot_path=args.vitonhd_dataroot,
+                                        size=(args.height, args.width))
     # elif args.dataset == "dresscode":
     dataset_train_dress = DressCodeDataset(dataroot_path=args.dresscode_dataroot,
-                                         phase='train',
-                                         outputlist=dataset_output_list,
-                                         size=(args.height, args.width))
+                                           phase='train',
+                                           outputlist=dataset_output_list,
+                                           size=(args.height, args.width))
     # else:
     #     raise NotImplementedError("Dataset should be either vitonhd or dresscode")
     combined_train_ds = torch.utils.data.ConcatDataset([dataset_train_vton, dataset_train_dress])
+
+    if args.dry_test:
+        # ========================= SUBSET for testing =========================
+        import random
+        # create a random list of 1000 integers between range 0 to len(combined_train_ds)
+
+        indices = random.sample(range(0, len(combined_train_ds)), 1000)
+
+        combined_train_ds = torch.utils.data.Subset(combined_train_ds, indices)
+    # ========================= SUBSET for testing =========================
+
     dataloader_train = DataLoader(batch_size=args.batch_size,
                                   dataset=combined_train_ds,
                                   shuffle=True,
                                   num_workers=args.workers)
-
 
     dataloader_train = fabric.setup_dataloaders(dataloader_train)
     # ======================================================================
@@ -383,36 +429,49 @@ def main(logger, fabric):
     # Validation dataset and dataloader
     # if args.dataset == "vitonhd":
     dataset_test_paired_viton = VitonHDDataset(phase='test',
-                                             dataroot_path=args.vitonhd_dataroot,
-                                             outputlist=dataset_output_list, size=(args.height, args.width))
-
-    dataset_test_unpaired_viton = VitonHDDataset(phase='test',
-                                               order='unpaired',
                                                dataroot_path=args.vitonhd_dataroot,
                                                outputlist=dataset_output_list, size=(args.height, args.width))
 
+    dataset_test_unpaired_viton = VitonHDDataset(phase='test',
+                                                 order='unpaired',
+                                                 dataroot_path=args.vitonhd_dataroot,
+                                                 outputlist=dataset_output_list, size=(args.height, args.width))
+
     # elif args.dataset == "dresscode":
     dataset_test_paired_dress = DressCodeDataset(dataroot_path=args.dresscode_dataroot,
-                                               phase='test',
-                                               outputlist=dataset_output_list, size=(args.height, args.width))
+                                                 phase='test',
+                                                 outputlist=dataset_output_list, size=(args.height, args.width))
 
     dataset_test_unpaired_dress = DressCodeDataset(phase='test',
-                                                 order='unpaired',
-                                                 dataroot_path=args.dresscode_dataroot,
-                                                 outputlist=dataset_output_list, size=(args.height, args.width))
+                                                   order='unpaired',
+                                                   dataroot_path=args.dresscode_dataroot,
+                                                   outputlist=dataset_output_list, size=(args.height, args.width))
 
     # else:
     #     raise NotImplementedError("Dataset should be either vitonhd or dresscode")
 
-    combined_test_ds = torch.utils.data.ConcatDataset([dataset_test_paired_viton, dataset_test_unpaired_viton, dataset_test_paired_dress, dataset_test_unpaired_dress])
+    combined_test_ds = torch.utils.data.ConcatDataset([
+        dataset_test_paired_viton,
+        # dataset_test_unpaired_viton,
+        dataset_test_paired_dress,
+        # dataset_test_unpaired_dress
+    ])
+    if args.dry_test:
+        # ========================= SUBSET for testing =========================
+        import random
+        # create a random list of 1000 integers between range 0 to len(combined_train_ds)
+
+        indices = random.sample(range(0, len(combined_test_ds)), 1000)
+
+        combined_test_ds = torch.utils.data.Subset(combined_test_ds, indices)
+        # ========================= SUBSET for testing =========================
 
     dataloader_test = DataLoader(batch_size=args.batch_size,
-                                        dataset=combined_test_ds,
-                                        shuffle=True,
-                                        num_workers=args.workers, drop_last=True)
+                                 dataset=combined_test_ds,
+                                 shuffle=True,
+                                 num_workers=args.workers, drop_last=True)
 
     dataloader_test = fabric.setup_dataloaders(dataloader_test)
-
 
     # ====================================================
     #               define models
@@ -432,6 +491,7 @@ def main(logger, fabric):
     optimizer_tps = torch.optim.Adam(tps.parameters(), lr=args.lr, betas=(0.5, 0.99))
     optimizer_ref = torch.optim.Adam(list(refinement.parameters()), lr=args.lr, betas=(0.5, 0.99))
 
+    # 🔴 put models to proper devices
     tps, optimizer_tps = fabric.setup(tps, optimizer_tps)
     refinement, optimizer_ref = fabric.setup(refinement, optimizer_ref)
 
@@ -439,29 +499,29 @@ def main(logger, fabric):
     criterion_l1 = nn.L1Loss()
 
     if args.vgg_weight > 0:
-        criterion_vgg = VGGLoss()
+        criterion_vgg = VGGLoss().to(fabric.device)
     else:
         criterion_vgg = None
 
     start_epoch = 0
 
     # ============================================================
-    #             load from per-trained ckpt logic
+    #             load from pre-trained ckpt logic
     # ============================================================
 
     if os.path.exists(os.path.join(args.checkpoints_dir, args.exp_name, f"checkpoint_last.pth")):
-        fabric.print('Loading full checkpoint')
+        fabric.print('Loading full checkpoint from pretrained ckpt ....')
 
         # REFERENCE: https://lightning.ai/docs/fabric/stable/guide/checkpoint.html
         EPOCH = None
         # define the state to load from
         _state = {
 
-            'tps' : tps,
-            'refinement' : refinement,
-            'optimizer_tps' : optimizer_tps,
-            'optimizer_ref' : optimizer_ref,
-            'epoch' : EPOCH
+            'tps': tps,
+            'refinement': refinement,
+            'optimizer_tps': optimizer_tps,
+            'optimizer_ref': optimizer_ref,
+            'epoch': EPOCH
         }
         # load the checkpoint on all devices
         fabric.load(os.path.join(args.checkpoints_dir, args.exp_name, f"checkpoint_last.pth"),
@@ -514,15 +574,19 @@ def main(logger, fabric):
     # ===============================================================
     # Training loop for TPS training
     # Set training dataset height and width to (256, 192) since the TPS is trained using a lower resolution
-    combined_train_ds.height = 256
-    combined_train_ds.width = 192
-    # dataset_train.height = 256
-    # dataset_train.width = 192
+    dataset_train_vton.height = 256
+    dataset_train_dress.height = 256
+    dataset_train_vton.width = 192
+    dataset_train_dress.width = 192
 
     for e in range(start_epoch, args.epochs_tps):
         fabric.print(f"Epoch {e}/{args.epochs_tps}")
         fabric.print('train')
         # one epoch for training
+        if args.dry_test:
+            batch = next(iter(dataloader_train))
+            fabric.print(batch['im_cloth'].shape)
+
         train_loss, train_l1_loss, train_const_loss, visual = training_loop_tps(
             dataloader_train,
             tps,
@@ -610,8 +674,14 @@ def main(logger, fabric):
 
     # Training loop for refinement
     # Set training dataset height and width to (args.height, args.width) since the refinement is trained using a higher resolution
-    combined_train_ds.height = args.height # set to 512 x 384
-    combined_train_ds.width = args.width
+    # combined_train_ds.height = args.height # set to 512 x 384
+    # combined_train_ds.width = args.width
+
+    dataset_train_vton.height = args.height
+    dataset_train_dress.height = args.height
+    dataset_train_vton.width = args.width
+    dataset_train_dress.width = args.width
+
     for e in range(max(start_epoch, args.epochs_tps), max(start_epoch, args.epochs_tps) + args.epochs_refinement):
         print(f"Epoch {e}/{max(start_epoch, args.epochs_tps) + args.epochs_refinement}")
         train_loss, train_l1_loss, train_vgg_loss, visual = training_loop_refinement(
@@ -722,6 +792,6 @@ def main(logger, fabric):
 if __name__ == '__main__':
     logger = TensorBoardLogger(root_dir="./logs",
                                name="multi-train-combined-tps")
-    fabric = Fabric(accelerator='auto', strategy='auto', devices='auto', precision='bf16-mixed', loggers=[logger])
+    fabric = Fabric(strategy='ddp', devices=3, precision='bf16-mixed', loggers=[logger])
     fabric.launch()
     main(logger, fabric)
